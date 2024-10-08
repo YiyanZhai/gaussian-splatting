@@ -22,6 +22,7 @@ from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
+from co3d.dataset.data_types import load_dataclass_jgzip, FrameAnnotation
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -34,6 +35,7 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
+    mask: np.array
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -97,9 +99,13 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
+        
+        # mask_folder is replacing images with masks
+        mask_path = image_path.replace("images", "masks")
+        mask = Image.open(mask_path) if os.path.exists(mask_path) else None
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height)
+                              image_path=image_path, image_name=image_name, width=width, height=height, mask=mask)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -109,8 +115,8 @@ def fetchPly(path):
     vertices = plydata['vertex']
     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
     colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
-    normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
-    return BasicPointCloud(points=positions, colors=colors, normals=normals)
+    # normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    return BasicPointCloud(points=positions, colors=colors, normals=None)
 
 def storePly(path, xyz, rgb):
     # Define the dtype for the structured array
@@ -129,21 +135,65 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, eval, llffhold=8):
-    try:
-        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
-        cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
-        cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
-        cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
-    except:
-        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.txt")
-        cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.txt")
-        cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
-        cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
+def get_frames_by_sequence(seq: str, category_frame_annotations_list):
+    # Filter the annotations based on the given sequence_name
+    return [frame for frame in category_frame_annotations_list if frame.sequence_name == seq]
+    
+from typing import List
+def frames_to_camera_info(image_path, filtered_frames):
+    cam_infos = []
+    for idx, frame in enumerate(filtered_frames):
+        # print(f"Reading frame {idx+1}/{len(filtered_frames)}")
+        viewpoint_info = frame.viewpoint
+        R = np.array(viewpoint_info.R)
+        T = np.array(viewpoint_info.T)
+        R[:, :2] *= -1
+        T[:2] *= -1
+        focal_length = viewpoint_info.focal_length
+        image_size = frame.image.size
+        width = image_size[1]
+        height = image_size[0]
+        focal_pixel = (focal_length[0] * height / 2, focal_length[1] * width / 2)
+        FovX = focal2fov(focal_pixel[1], width)
+        FovY = focal2fov(focal_pixel[0], height)
+        # get the last from frame.image.path
+        image_last = frame.image.path.split("/")[-1]
+        image_name = image_last.split(".")[0]
+        sub_img_path = os.path.join(image_path, image_last)
+        if not os.path.exists(image_path):
 
-    reading_dir = "images" if images == None else images
-    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
-    cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
+            print("Image does not exist for path: ", image_path)
+        image = Image.open(sub_img_path) if os.path.exists(sub_img_path) else None
+
+        mask_path = sub_img_path.replace("images", "masks")
+        mask_path = mask_path.replace("jpg", "png")
+        # print(mask_path)
+        mask = Image.open(mask_path) if os.path.exists(mask_path) else None
+        # print(mask)
+
+        file_dir = "/home/viv/viv/gaussian-splatting"
+        with open(f"{file_dir}/camera_infos.csv", 'a') as f:
+            f.write(f"{1}, {R.tolist()}, {T.tolist()}, {FovY}, {FovX}, {sub_img_path}, {image_name}, {width}, {height}, {image.size}\n")
+
+        camera_info = CameraInfo(uid=1, R=R, T=T, FovY=FovX, FovX=FovY,
+                                    image=image, image_path=sub_img_path, image_name=image_name, width=width, height=height, mask=mask)
+        cam_infos.append(camera_info)
+    return cam_infos
+
+def readColmapSceneInfo(path, seq, images, eval, llffhold=8):
+    frame_annotations_file = os.path.join(path, "frame_annotations.jgz")
+    category_frame_annotations = load_dataclass_jgzip(frame_annotations_file, List[FrameAnnotation])
+    category_frame_annotations_list = [ann for ann in category_frame_annotations]
+    # print(f"Found {len(category_frame_annotations_list)} frame annotations")
+    # # print the first 5 frame annotations
+    # for idx, frame in enumerate(category_frame_annotations_list[:5]):
+    #     print(f"Frame {idx+1}: {frame}")
+
+    filtered_frames = get_frames_by_sequence(seq, category_frame_annotations_list)
+
+    reading_dir = os.path.join(path, seq, "images")
+
+    cam_infos = frames_to_camera_info(reading_dir, filtered_frames)
 
     if eval:
         train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
@@ -154,20 +204,8 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(path, "sparse/0/points3D.ply")
-    bin_path = os.path.join(path, "sparse/0/points3D.bin")
-    txt_path = os.path.join(path, "sparse/0/points3D.txt")
-    if not os.path.exists(ply_path):
-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
-        try:
-            xyz, rgb, _ = read_points3D_binary(bin_path)
-        except:
-            xyz, rgb, _ = read_points3D_text(txt_path)
-        storePly(ply_path, xyz, rgb)
-    try:
-        pcd = fetchPly(ply_path)
-    except:
-        pcd = None
+    ply_path = os.path.join(path, seq, "pointcloud.ply")
+    pcd = fetchPly(ply_path)
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
@@ -213,48 +251,11 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             FovY = fovy 
             FovX = fovx
 
-            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+            cam_infos.append(CameraInfo(uid=1, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                             image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
             
     return cam_infos
 
-def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
-    print("Reading Training Transforms")
-    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
-    print("Reading Test Transforms")
-    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
-    
-    if not eval:
-        train_cam_infos.extend(test_cam_infos)
-        test_cam_infos = []
-
-    nerf_normalization = getNerfppNorm(train_cam_infos)
-
-    ply_path = os.path.join(path, "points3d.ply")
-    if not os.path.exists(ply_path):
-        # Since this data set has no colmap data, we start with random points
-        num_pts = 100_000
-        print(f"Generating random point cloud ({num_pts})...")
-        
-        # We create random points inside the bounds of the synthetic Blender scenes
-        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
-        shs = np.random.random((num_pts, 3)) / 255.0
-        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
-
-        storePly(ply_path, xyz, SH2RGB(shs) * 255)
-    try:
-        pcd = fetchPly(ply_path)
-    except:
-        pcd = None
-
-    scene_info = SceneInfo(point_cloud=pcd,
-                           train_cameras=train_cam_infos,
-                           test_cameras=test_cam_infos,
-                           nerf_normalization=nerf_normalization,
-                           ply_path=ply_path)
-    return scene_info
-
 sceneLoadTypeCallbacks = {
-    "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Colmap": readColmapSceneInfo
 }

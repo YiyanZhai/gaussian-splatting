@@ -49,6 +49,7 @@ class ModelParams(ParamGroup):
         self.sh_degree = 3
         self._source_path = ""
         self._model_path = ""
+        self._kseq = ""
         self._images = "images"
         self._resolution = -1
         self._white_background = False
@@ -59,6 +60,7 @@ class ModelParams(ParamGroup):
     def extract(self, args):
         g = super().extract(args)
         g.source_path = os.path.abspath(g.source_path)
+        g.seq = g.kseq
         return g
 
 class PipelineParams(ParamGroup):
